@@ -29,6 +29,13 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from calendar_client import add_event_to_calendar
 # 📌 ИСПРАВЛЕНО: импортируем get_prompts_with_dates из llm_client для админки
 from llm_client import query_llm, set_model, get_model, get_prompts_with_dates as get_llm_prompts
+from event_parser import (
+    analyze_transcript,
+    format_plan_response,
+    format_today_response,
+    format_tomorrow_response,
+    format_last_week_response,
+)
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 from pydub.silence import split_on_silence
 from pydub import AudioSegment, effects
@@ -522,6 +529,43 @@ async def handle_show_transcription(message: Message):
     await message.answer("<b>Вот последняя транскрипция:</b>")
     await send_long_text(message, row[0])
 
+    transcribed_text = row[0]
+
+    try:
+        analysis = analyze_transcript(transcribed_text, tz)
+    except Exception as e:
+        logger.error(f"Ошибка анализа для повторного просмотра транскрипции: {e}", exc_info=True)
+        await message.answer("❌ Не удалось проанализировать текст. Попробуйте отправить аудио ещё раз.")
+        return
+
+    await message.answer("⏳ Повторный анализ задач...")
+    plan_text = format_plan_response(analysis)
+    if len(plan_text) > 4000:
+        await send_long_text(message, plan_text)
+    else:
+        await message.answer(plan_text)
+
+    await message.answer("⏳ Повторный анализ встреч сегодня...")
+    today_text = format_today_response(analysis)
+    if len(today_text) > 4000:
+        await send_long_text(message, today_text)
+    else:
+        await message.answer(today_text)
+
+    await message.answer("⏳ Повторный анализ встреч завтра...")
+    tomorrow_text = format_tomorrow_response(analysis)
+    if len(tomorrow_text) > 4000:
+        await send_long_text(message, tomorrow_text)
+    else:
+        await message.answer(tomorrow_text)
+
+    await message.answer("⏳ Повторный анализ за прошлую неделю...")
+    last_week_text = format_last_week_response(analysis)
+    if len(last_week_text) > 4000:
+        await send_long_text(message, last_week_text)
+    else:
+        await message.answer(last_week_text)
+
 @dp.message(lambda message: message.text == "📝 Что мне нужно запланировать?")
 async def handle_plan(message: Message):
     if not is_allowed(message.from_user.id):
@@ -535,23 +579,22 @@ async def handle_plan(message: Message):
         return
 
     transcribed_text = row[0]
-    await message.answer("⏳ Анализирую все события...")
+    await message.answer("⏳ Собираю события и задачи для планирования...")
 
     try:
-        # Теперь mode="todo" будет возвращать ВСЕ события (встречи + задачи)
-        all_events = query_llm(transcribed_text, mode="todo")
-        
-        # ИСПРАВЛЕНО: Улучшена проверка пустых результатов
-        if not all_events or not all_events.strip():
-            await message.answer("📭 Нет событий для планирования.")
-        elif any(phrase in all_events.lower() for phrase in ["нет событий", "нет задач", "событий не найдено", "задач не найдено", "планирования"]):
-            await message.answer("📭 Нет событий для планирования.")
+        # ✅ Новый надёжный анализ: используем локальный парсер вместо LLM
+        analysis = analyze_transcript(transcribed_text, tz)
+        response_text = format_plan_response(analysis)
+        if len(response_text) > 4000:
+            await send_long_text(message, response_text)
         else:
-            await message.answer(f"✅ Вот все ваши события:\n\n{all_events}")
-            
+            await message.answer(response_text)
+
     except Exception as e:
-        logger.error(f"Ошибка при запросе LLM: {e}")
-        await message.answer("❌ Произошла ошибка при анализе текста.")
+        logger.error(f"Ошибка локального анализа задач: {e}", exc_info=True)
+        await message.answer(
+            "❌ Не удалось разобрать текст. Попробуйте уточнить формулировки или отправьте запись ещё раз."
+        )
 
 @dp.message(lambda message: message.text == "👥 С кем я сегодня встречался?")
 async def handle_meetings_today(message: Message):
@@ -566,30 +609,20 @@ async def handle_meetings_today(message: Message):
         return
 
     transcribed_text = row[0]
-    await message.answer("⏳ Анализирую встречи...")
+    await message.answer("⏳ Ищу встречи за сегодняшний день...")
 
     try:
-        # 📌 ИСПРАВЛЕНО: Теперь этот вызов использует АКТУАЛЬНУЮ дату
-        result = query_llm(transcribed_text, mode="today_meetings")
-
-        # ИСПРАВЛЕНО: Улучшена логика повторного анализа (оставлена для надежности)
-        if (
-            result and ("встреч не было" in result.lower() or "планов нет" in result.lower())
-            and any(phrase in transcribed_text.lower() for phrase in ["встреча с", "встреча была", "была встреча", "встречался", "встречались", "сегодня"])
-        ):
-            await message.answer("🔁 Повторный анализ: похоже, встречи всё же были...")
-            result = query_llm(transcribed_text, mode="today_meetings")
-
-        # ИСПРАВЛЕНО: Улучшена проверка пустых результатов
-        if not result or not result.strip():
-            await message.answer("📭 Сегодня рабочих планов нет.")
-        elif any(phrase in result.lower() for phrase in ["встреч не было", "встреч нет", "встреч не найдено", "планов нет"]):
-            await message.answer("📭 Сегодня рабочих планов нет.")
+        analysis = analyze_transcript(transcribed_text, tz)
+        response_text = format_today_response(analysis)
+        if len(response_text) > 4000:
+            await send_long_text(message, response_text)
         else:
-            await message.answer(f"✅ Ваши планы на сегодня:\n\n{result}")
+            await message.answer(response_text)
     except Exception as e:
-        logger.error(f"Ошибка при запросе LLM: {e}")
-        await message.answer("❌ Произошла ошибка при анализе текста.")
+        logger.error(f"Ошибка локального анализа встреч сегодня: {e}", exc_info=True)
+        await message.answer(
+            "❌ Не удалось выделить встречи за сегодня. Попробуйте указать дату или время в тексте."
+        )
 
 @dp.message(lambda message: message.text == "📅 Какой план встреч у меня может быть завтра?")
 async def handle_meetings_tomorrow(message: Message):
@@ -604,30 +637,20 @@ async def handle_meetings_tomorrow(message: Message):
         return
 
     transcribed_text = row[0]
-    await message.answer("⏳ Анализирую встречи на завтра...")
+    await message.answer("⏳ Собираю встречи, запланированные на завтра...")
 
     try:
-        # 📌 ИСПРАВЛЕНО: Теперь этот вызов использует АКТУАЛЬНУЮ дату "завтра"
-        result = query_llm(transcribed_text, mode="tomorrow_meetings")
-
-        # ИСПРАВЛЕНО: Улучшена логика повторного анализа
-        if (
-            result and ("встреч нет" in result.lower() or "планов нет" in result.lower())
-            and any(phrase in transcribed_text.lower() for phrase in ["завтра", "встреча", "встреча с", "встреча была", "встречался", "встречались"])
-        ):
-            await message.answer("🔁 Повторный анализ: возможно, встречи есть...")
-            result = query_llm(transcribed_text, mode="tomorrow_meetings")
-
-        # ИСПРАВЛЕНО: Улучшена проверка пустых результатов
-        if not result or not result.strip():
-            await message.answer("📭 Планов на завтра не запланировано.")
-        elif any(phrase in result.lower() for phrase in ["встреч нет", "встреч не было", "встреч не найдено", "планов нет"]):
-            await message.answer("📭 Планов на завтра не запланировано.")
+        analysis = analyze_transcript(transcribed_text, tz)
+        response_text = format_tomorrow_response(analysis)
+        if len(response_text) > 4000:
+            await send_long_text(message, response_text)
         else:
-            await message.answer(f"✅ Ваши планы на завтра:\n\n{result}")
+            await message.answer(response_text)
     except Exception as e:
-        logger.error(f"Ошибка при запросе LLM (завтра): {e}")
-        await message.answer("❌ Произошла ошибка при анализе текста.")
+        logger.error(f"Ошибка локального анализа встреч завтра: {e}", exc_info=True)
+        await message.answer(
+            "❌ Не удалось определить планы на завтра. Проверьте, что в тексте есть слова «завтра» или конкретная дата."
+        )
 
 @dp.message(lambda message: message.text == "🕒 Какие встречи были на прошлой неделе?")
 async def handle_meetings_last_week(message: Message):
@@ -642,31 +665,21 @@ async def handle_meetings_last_week(message: Message):
         return
 
     transcribed_text = row[0]
-    await message.answer("⏳ Анализирую встречи за прошлую неделю...")
+    await message.answer("⏳ Ищу события за прошлую неделю...")
 
     try:
-        # 📌 ИСПРАВЛЕНО: Теперь этот вызов использует АКТУАЛЬНЫЙ диапазон "прошлой недели"
-        result = query_llm(transcribed_text, mode="last_week_meetings")
-
-        # ИСПРАВЛЕНО: Улучшена логика повторного анализа
-        if (
-            result and "встреч не было" in result.lower()
-            and any(phrase in transcribed_text.lower() for phrase in ["встреча с", "встреча была", "была встреча", "встречался", "встречались", "прошлой неделе", "на прошлой неделе"])
-        ):
-            await message.answer("🔁 Повторный анализ: в тексте упоминаются встречи, пробую ещё раз...")
-            result = query_llm(transcribed_text, mode="last_week_meetings")
-
-        # ИСПРАВЛЕНО: Улучшена проверка пустых результатов
-        if not result or not result.strip():
-            await message.answer("📭 Встреч за прошлую неделю не было.")
-        elif any(phrase in result.lower() for phrase in ["встреч не было", "встреч нет", "встреч не найдено"]):
-            await message.answer("📭 Встреч за прошлую неделю не было.")
+        analysis = analyze_transcript(transcribed_text, tz)
+        response_text = format_last_week_response(analysis)
+        if len(response_text) > 4000:
+            await send_long_text(message, response_text)
         else:
-            await message.answer(f"✅ Встречи за прошлую неделю:\n\n{result}")
+            await message.answer(response_text)
 
     except Exception as e:
-        logger.error(f"Ошибка при запросе LLM (неделя): {e}")
-        await message.answer("❌ Ошибка при анализе.")
+        logger.error(f"Ошибка локального анализа прошлой недели: {e}", exc_info=True)
+        await message.answer(
+            "❌ Не удалось собрать встречи за прошлую неделю. Убедитесь, что в тексте указаны даты предыдущей недели."
+        )
 
 @dp.message(lambda message: message.text == "🔁 Повторить весь анализ")
 async def handle_repeat_full_analysis(message: Message):
@@ -682,53 +695,40 @@ async def handle_repeat_full_analysis(message: Message):
 
     transcribed_text = row[0]
 
-    await message.answer("⏳ Повторный анализ задач...")
     try:
-        tasks = query_llm(transcribed_text, mode="todo")
-        # ИСПРАВЛЕНО: Улучшена обработка результатов
-        if tasks and tasks.strip() and not any(phrase in tasks.lower() for phrase in ["нет событий", "нет задач", "событий не найдено", "задач не найдено", "планирования"]):
-            await message.answer("📝 Задачи:\n" + tasks)
-        else:
-            await message.answer("📝 Задачи: —")
+        analysis = analyze_transcript(transcribed_text, tz)
     except Exception as e:
-        logger.error(f"Ошибка при анализе задач: {e}")
-        await message.answer("❌ Ошибка при анализе задач.")
+        logger.error(f"Ошибка повторного анализа текста: {e}", exc_info=True)
+        await message.answer("❌ Не удалось повторить анализ. Попробуйте позже или обновите запись.")
+        return
+
+    await message.answer("⏳ Повторный анализ задач...")
+    plan_text = format_plan_response(analysis)
+    if len(plan_text) > 4000:
+        await send_long_text(message, plan_text)
+    else:
+        await message.answer(plan_text)
 
     await message.answer("⏳ Повторный анализ встреч сегодня...")
-    try:
-        today = query_llm(transcribed_text, mode="today_meetings")
-        # ИСПРАВЛЕНО: Улучшена обработка результатов
-        if today and today.strip() and not any(phrase in today.lower() for phrase in ["встреч не было", "встреч нет", "встреч не найдено", "планов нет"]):
-            await message.answer("👥 Планы на сегодня:\n" + today)
-        else:
-            await message.answer("👥 Планы на сегодня: —")
-    except Exception as e:
-        logger.error(f"Ошибка при анализе встреч сегодня: {e}")
-        await message.answer("❌ Ошибка при анализе встреч сегодня.")
+    today_text = format_today_response(analysis)
+    if len(today_text) > 4000:
+        await send_long_text(message, today_text)
+    else:
+        await message.answer(today_text)
 
     await message.answer("⏳ Повторный анализ встреч завтра...")
-    try:
-        tomorrow = query_llm(transcribed_text, mode="tomorrow_meetings")
-        # ИСПРАВЛЕНО: Улучшена обработка результатов
-        if tomorrow and tomorrow.strip() and not any(phrase in tomorrow.lower() for phrase in ["встреч нет", "встреч не было", "встреч не найдено", "планов нет"]):
-            await message.answer("📅 Планы на завтра:\n" + tomorrow)
-        else:
-            await message.answer("📅 Планы на завтра: —")
-    except Exception as e:
-        logger.error(f"Ошибка при анализе встреч завтра: {e}")
-        await message.answer("❌ Ошибка при анализе встреч завтра.")
+    tomorrow_text = format_tomorrow_response(analysis)
+    if len(tomorrow_text) > 4000:
+        await send_long_text(message, tomorrow_text)
+    else:
+        await message.answer(tomorrow_text)
 
     await message.answer("⏳ Повторный анализ за прошлую неделю...")
-    try:
-        last_week = query_llm(transcribed_text, mode="last_week_meetings")
-        # ИСПРАВЛЕНО: Улучшена обработка результатов
-        if last_week and last_week.strip() and not any(phrase in last_week.lower() for phrase in ["встреч не было", "встреч нет", "встреч не найдено"]):
-            await message.answer("🕒 Встречи за прошлую неделю:\n" + last_week)
-        else:
-            await message.answer("🕒 Встречи за прошлую неделю: —")
-    except Exception as e:
-        logger.error(f"Ошибка при анализе прошлой недели: {e}")
-        await message.answer("❌ Ошибка при анализе прошлой недели.")
+    last_week_text = format_last_week_response(analysis)
+    if len(last_week_text) > 4000:
+        await send_long_text(message, last_week_text)
+    else:
+        await message.answer(last_week_text)
 
 @dp.message(lambda message: message.text == "📌 Добавь в календарь")
 async def handle_add_to_calendar(message: Message):
